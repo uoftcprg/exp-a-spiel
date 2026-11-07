@@ -60,6 +60,25 @@ template <typename T> struct Traverser {
   void compute_openspiel_infostate(const uint8_t player, int64_t i, std::span<bool> buf) const;
   void compute_openspiel_infostates(const uint8_t player, std::span<bool> buf) const;
 
+  // --- Sequence-form payoff matrix A (utility of player 0) -----------------
+  // Sequences are indexed as 9 * infoset_row + action (same layout as the
+  // flattened (NUM_INFOS, 9) strategy / gradient arrays). Then
+  //   ev0 = x^T A y,  gradient[0] = A y,  gradient[1] = -A^T x.
+  // The game tree is split into 81 subtrees: subtree i starts after player 0
+  // plays cell i % 9 and player 1 plays cell i / 9 (as in compute_gradients).
+  // count_utility_nonzeros returns the number of decisive (non-tie) leaves of
+  // each selected subtree (0 for unselected ones); fill_utility_matrix writes
+  // the COO triplets of the selected subtrees, in subtree order, into buffers
+  // of size sum(counts). Payoffs are +1 (player 0 wins) / -1 (player 1 wins).
+  static constexpr int NUM_SUBTREES = 81;
+  using SubtreeMask = std::array<bool, NUM_SUBTREES>;
+  using SubtreeCounts = std::array<uint64_t, NUM_SUBTREES>;
+  SubtreeCounts count_utility_nonzeros(const SubtreeMask &selected) const;
+  void fill_utility_matrix(const SubtreeMask &selected,
+                           const SubtreeCounts &counts,
+                           std::span<uint32_t> seq0, std::span<uint32_t> seq1,
+                           std::span<int8_t> u0) const;
+
 private:
   PerPlayer<std::array<std::valarray<Real>, 9>> bufs_;
   PerPlayer<std::valarray<Real>> sf_strategies_;

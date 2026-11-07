@@ -94,6 +94,63 @@ void compute_gradients_thread(
     }
   }
 }
+
+// Same DFS as compute_gradients_thread, but calls f(seq0, seq1, w) at every
+// decisive terminal leaf (w = winner, 0 or 1) instead of accumulating
+// gradients.
+template <typename T, typename F>
+void visit_decisive_leaves_thread(
+    T root, const PerPlayer<uint32_t> init_parent_seqs,
+    const PerPlayer<std::shared_ptr<Treeplex>> &treeplex, F &&f) {
+  std::tuple<T, PerPlayer<uint32_t>> stack[100];
+  stack[0] = {root, init_parent_seqs};
+  size_t stack_len = 1;
+
+  while (stack_len) {
+    const auto it = stack[--stack_len];
+    const T &s = std::get<0>(it);
+    const PerPlayer<uint32_t> &seqs = std::get<1>(it);
+    const uint8_t w = s.winner();
+
+    if (w == 0xff) {
+      const uint8_t p = s.player();
+      const uint32_t info_id =
+          treeplex[p]->infosets.at(s.get_infoset()).infoset_id;
+      PerPlayer<uint32_t> new_seqs = seqs;
+
+      uint32_t a = s.available_actions();
+      for (uint32_t i = 0; a; ++i, a >>= 1) {
+        if (a & 1) {
+          T ss = s;
+          ss.next(i);
+          new_seqs[p] = 9 * info_id + i;
+          stack[stack_len++] = {ss, new_seqs};
+          assert(stack_len < 100);
+        }
+      }
+    } else if (w == 0 || w == 1) {
+      f(seqs[0], seqs[1], w);
+    } // ties (TIE) have zero utility and are skipped
+  }
+}
+
+// Plays the first move of each player (subtree i in [0, 81)), mirroring the
+// setup in Traverser<T>::compute_gradients. Returns false if illegal.
+template <typename T>
+bool setup_subtree(const int i,
+                   const PerPlayer<std::shared_ptr<Treeplex>> &treeplex, T &s,
+                   PerPlayer<uint32_t> &seqs) {
+  s = T{};
+  if (!is_valid(s.available_actions(), i % 9))
+    return false;
+  seqs[0] = treeplex[0]->infosets.at(s.get_infoset()).infoset_id * 9 + (i % 9);
+  s.next(i % 9);
+  if (!is_valid(s.available_actions(), i / 9))
+    return false;
+  seqs[1] = treeplex[1]->infosets.at(s.get_infoset()).infoset_id * 9 + (i / 9);
+  s.next(i / 9);
+  return true;
+}
 } // namespace
 
 bool Treeplex::is_valid_vector(ConstRealBuf buf) const {
@@ -524,6 +581,55 @@ void Traverser<T>::compute_sf_strategies_(
     std::copy(strategies[p].begin(), strategies[p].end(),
               std::begin(sf_strategies_[p]));
     treeplex[p]->bh_to_sf(sf_strategies_[p]);
+  }
+}
+
+template <typename T>
+typename Traverser<T>::SubtreeCounts
+Traverser<T>::count_utility_nonzeros(const SubtreeMask &selected) const {
+  SubtreeCounts counts{};
+#pragma omp parallel for schedule(dynamic)
+  for (int i = 0; i < NUM_SUBTREES; ++i) {
+    T s;
+    PerPlayer<uint32_t> seqs = {0, 0};
+    if (!selected[i] || !setup_subtree(i, treeplex, s, seqs))
+      continue;
+    uint64_t c = 0;
+    visit_decisive_leaves_thread(s, seqs, treeplex,
+                                 [&c](uint32_t, uint32_t, uint8_t) { ++c; });
+    counts[i] = c;
+  }
+  return counts;
+}
+
+template <typename T>
+void Traverser<T>::fill_utility_matrix(const SubtreeMask &selected,
+                                       const SubtreeCounts &counts,
+                                       std::span<uint32_t> seq0,
+                                       std::span<uint32_t> seq1,
+                                       std::span<int8_t> u0) const {
+  std::array<uint64_t, NUM_SUBTREES + 1> offsets{};
+  for (int i = 0; i < NUM_SUBTREES; ++i)
+    offsets[i + 1] = offsets[i] + (selected[i] ? counts[i] : 0);
+  CHECK(seq0.size() == offsets.back() && seq1.size() == offsets.back() &&
+            u0.size() == offsets.back(),
+        "Output buffers must have size %lu", offsets.back());
+
+#pragma omp parallel for schedule(dynamic)
+  for (int i = 0; i < NUM_SUBTREES; ++i) {
+    T s;
+    PerPlayer<uint32_t> seqs = {0, 0};
+    if (!selected[i] || !setup_subtree(i, treeplex, s, seqs))
+      continue;
+    uint64_t k = offsets[i];
+    visit_decisive_leaves_thread(
+        s, seqs, treeplex, [&](uint32_t a, uint32_t b, uint8_t w) {
+          seq0[k] = a;
+          seq1[k] = b;
+          u0[k] = w == 0 ? 1 : -1; // utility of player 0
+          ++k;
+        });
+    CHECK(k == offsets[i + 1], "Leaf count mismatch in subtree %d", i);
   }
 }
 

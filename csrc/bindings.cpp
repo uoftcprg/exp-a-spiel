@@ -62,6 +62,24 @@ struct EvExplPy {
   }
 };
 
+// None -> all subtrees; otherwise the listed subtree ids in [0, 81).
+template <typename T>
+typename Traverser<T>::SubtreeMask
+subtree_mask(const std::optional<std::vector<int>> &subtrees) {
+  typename Traverser<T>::SubtreeMask mask{};
+  if (!subtrees) {
+    mask.fill(true);
+    return mask;
+  }
+  for (const int i : *subtrees) {
+    CHECK(i >= 0 && i < Traverser<T>::NUM_SUBTREES,
+          "Invalid subtree id %d (expected in [0, %d))", i,
+          Traverser<T>::NUM_SUBTREES);
+    mask[i] = true;
+  }
+  return mask;
+}
+
 template <typename T>
 void register_types(py::module &m, const std::string &prefix) {
   py::class_<T>(m, (prefix + "State").c_str())
@@ -267,6 +285,81 @@ void register_types(py::module &m, const std::string &prefix) {
              return CfrSolver<T>(traverser, conf);
            },
            py::arg("cfr_conf"))
+      // ---- treeplex / sequence-form accessors ------------------------------
+      .def(
+          "legal_actions",
+          [](const Traverser<T> &traverser, const uint8_t p) -> BoolNdArray {
+            CHECK(p == 0 || p == 1,
+                  "Invalid player (expected 0 or 1; found %d)", p);
+            const auto &tpx = *traverser.treeplex[p];
+            const py::ssize_t n = tpx.num_infosets();
+            BoolNdArray out(std::array<py::ssize_t, 2>{n, 9});
+            auto m = out.mutable_unchecked<2>();
+            for (py::ssize_t i = 0; i < n; ++i)
+              for (int j = 0; j < 9; ++j)
+                m(i, j) = is_valid(tpx.legal_actions[i], j);
+            return out;
+          },
+          py::arg("player"))
+      .def(
+          "parent_sequences",
+          [](const Traverser<T> &traverser,
+             const uint8_t p) -> py::array_t<int64_t> {
+            CHECK(p == 0 || p == 1,
+                  "Invalid player (expected 0 or 1; found %d)", p);
+            const auto &tpx = *traverser.treeplex[p];
+            const py::ssize_t n = tpx.num_infosets();
+            py::array_t<int64_t> out(n);
+            auto m = out.mutable_unchecked<1>();
+            m(0) = -1; // row 0 is the root infoset: empty parent sequence
+            for (py::ssize_t i = 1; i < n; ++i)
+              m(i) = int64_t(9) * tpx.parent_index[i] +
+                     parent_action(tpx.infoset_keys[i]);
+            return out;
+          },
+          py::arg("player"))
+      .def_property_readonly_static(
+          "NUM_SUBTREES",
+          [](py::object) { return Traverser<T>::NUM_SUBTREES; })
+      .def(
+          "utility_matrix_nnz",
+          [](const Traverser<T> &traverser,
+             const std::optional<std::vector<int>> &subtrees) -> uint64_t {
+            const auto mask = subtree_mask<T>(subtrees);
+            py::gil_scoped_release release;
+            uint64_t nnz = 0;
+            for (auto c : traverser.count_utility_nonzeros(mask))
+              nnz += c;
+            return nnz;
+          },
+          py::arg("subtrees") = std::nullopt)
+      .def(
+          "utility_matrix",
+          [](const Traverser<T> &traverser,
+             const std::optional<std::vector<int>> &subtrees)
+              -> std::tuple<py::array_t<uint32_t>, py::array_t<uint32_t>,
+                            py::array_t<int8_t>> {
+            const auto mask = subtree_mask<T>(subtrees);
+            typename Traverser<T>::SubtreeCounts counts;
+            {
+              py::gil_scoped_release release;
+              counts = traverser.count_utility_nonzeros(mask);
+            }
+            uint64_t nnz = 0;
+            for (auto c : counts)
+              nnz += c;
+            py::array_t<uint32_t> seq0(nnz), seq1(nnz);
+            py::array_t<int8_t> u0(nnz);
+            {
+              std::span<uint32_t> s0(seq0.mutable_data(), nnz);
+              std::span<uint32_t> s1(seq1.mutable_data(), nnz);
+              std::span<int8_t> u(u0.mutable_data(), nnz);
+              py::gil_scoped_release release;
+              traverser.fill_utility_matrix(mask, counts, s0, s1, u);
+            }
+            return std::make_tuple(seq0, seq1, u0);
+          },
+          py::arg("subtrees") = std::nullopt)
         ;
 
   py::class_<CfrSolver<T>>(m, (prefix + "CfrSolver").c_str())
